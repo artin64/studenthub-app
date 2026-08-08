@@ -1,0 +1,602 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  STUDENT
+  PROFESSOR
+  ADMIN
+  PARENT
+  COMPANY
+}
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+  REJECTED
+  SUSPENDED
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  COMPLETED
+  DROPPED
+}
+
+enum SubmissionStatus {
+  SUBMITTED
+  REVIEWED
+}
+
+enum ExamStatus {
+  DRAFT
+  PUBLISHED
+  CLOSED
+}
+
+enum QuestionType {
+  MULTIPLE_CHOICE
+  ESSAY
+}
+
+enum PostStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ParentLinkStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum NotificationType {
+  ASSIGNMENT_CREATED
+  SUBMISSION_GRADED
+  EXAM_PUBLISHED
+  ATTENDANCE_SESSION_OPENED
+  REGISTRATION_SUBMITTED
+  REGISTRATION_APPROVED
+  REGISTRATION_REJECTED
+  PARENT_LINK_REQUESTED
+  PARENT_LINK_APPROVED
+  PARENT_LINK_REJECTED
+  FORUM_POST_PENDING_REVIEW
+  FORUM_POST_APPROVED
+  FORUM_POST_REJECTED
+  EXAM_ATTEMPT_FLAGGED
+  TASK_REMINDER
+}
+
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  role         Role
+  status       UserStatus @default(PENDING)
+  isAlumnus    Boolean    @default(false)
+  alumniCompany String?
+  alumniRole   String?
+
+  // Profile
+  bio             String?
+  profileImageUrl String?
+
+  // Approval audit trail
+  approvedById String?
+  approvedBy   User?     @relation("UserApprovedBy", fields: [approvedById], references: [id])
+  approvedAt   DateTime?
+  rejectionReason String?
+  approvedUsers User[]   @relation("UserApprovedBy")
+
+  // 2FA (email verification code at login)
+  twoFactorCodeHash      String?
+  twoFactorCodeExpiresAt DateTime?
+
+  // Password reset
+  passwordResetTokenHash String?
+  passwordResetExpiresAt DateTime?
+
+  lastLoginAt DateTime?
+  // Bumped on password reset and on suspension. Embedded in every JWT we
+  // issue; if it doesn't match the current DB value the token is rejected.
+  // This is what makes "suspend this account" or "reset this password"
+  // actually kick out any session already logged in, instead of just
+  // blocking new logins.
+  tokenVersion Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  enrollments        Enrollment[]
+  submissions        Submission[]
+  attendanceRecords  AttendanceRecord[]
+  gradesReceived     Grade[]             @relation("GradeStudent")
+  gradesGiven        Grade[]             @relation("GradeGivenBy")
+  coursesTaught      Course[]            @relation("CourseProfessor")
+  attendanceSessions AttendanceSession[]
+  assignmentsCreated Assignment[]        @relation("AssignmentCreatedBy")
+  examsCreated       Exam[]              @relation("ExamCreatedBy")
+  examAttempts       ExamAttempt[]
+  notifications      Notification[]
+  portfolioItems     PortfolioItem[]
+  certificates       Certificate[]       @relation("CertificateStudent")
+  certificatesIssued Certificate[]       @relation("CertificateIssuedBy")
+  jobsPosted         JobListing[]        @relation("JobPostedBy")
+  jobApplications    JobApplication[]    @relation("JobApplicant")
+  cvProfile          CvProfile?
+  libraryResourcesAdded LibraryResource[]
+  materialsAdded        CourseMaterial[]
+  childLinks            ParentLink[]      @relation("ParentOf")
+  parentLinks            ParentLink[]      @relation("ChildOf")
+  parentLinksApproved   ParentLink[]      @relation("ParentLinkApprovedBy")
+  messagesSent          Message[]         @relation("MessageSender")
+  messagesReceived      Message[]         @relation("MessageReceiver")
+  forumPosts            ForumPost[]
+  forumPostsReviewed    ForumPost[]       @relation("ForumPostReviewedBy")
+  forumReplies          ForumReply[]
+  groupMemberships      GroupMember[]
+  peerReviews           PeerReview[]
+
+  // Speeds up "list pending students for approval", "list all professors", etc.
+  // at 100k+ rows this is the difference between an instant query and a full table scan.
+  @@index([role, status])
+  @@map("users")
+}
+
+model Course {
+  id            String      @id @default(uuid())
+  title         String
+  description   String?
+  professorId   String
+  professor     User        @relation("CourseProfessor", fields: [professorId], references: [id])
+  departmentId  String?
+  department    Department? @relation(fields: [departmentId], references: [id])
+  ectsCredits   Int         @default(6)
+  // Soft delete only. "Deleting" a course NEVER runs a SQL DELETE on real
+  // academic data — it sets this timestamp and the course is hidden from
+  // normal lists. Grades, submissions, certificates already issued, and
+  // attendance history stay intact and recoverable by an admin. See
+  // courses.service.ts `remove()`.
+  archivedAt    DateTime?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  enrollments        Enrollment[]
+  assignments        Assignment[]
+  attendanceSessions AttendanceSession[]
+  exams              Exam[]
+  certificates       Certificate[]
+  materials          CourseMaterial[]
+  forumPosts         ForumPost[]
+  projectGroups      ProjectGroup[]
+
+  @@index([professorId])
+  @@index([departmentId])
+  @@map("courses")
+}
+
+model Enrollment {
+  id         String           @id @default(uuid())
+  studentId  String
+  student    User             @relation(fields: [studentId], references: [id])
+  courseId   String
+  course     Course           @relation(fields: [courseId], references: [id])
+  status     EnrollmentStatus @default(ACTIVE)
+  enrolledAt DateTime         @default(now())
+
+  @@unique([studentId, courseId])
+  @@index([courseId])
+  @@map("enrollments")
+}
+
+model Assignment {
+  id                 String   @id @default(uuid())
+  title              String
+  description        String?
+  courseId           String
+  course             Course   @relation(fields: [courseId], references: [id])
+  createdById        String
+  createdBy          User     @relation("AssignmentCreatedBy", fields: [createdById], references: [id])
+  dueDate            DateTime
+  maxScore           Int      @default(100)
+  peerReviewEnabled  Boolean  @default(false)
+  // Soft delete — see Course.archivedAt above. A submitted student
+  // submission must never disappear because a professor clicked delete.
+  archivedAt         DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  submissions Submission[]
+
+  @@index([courseId])
+  @@map("assignments")
+}
+
+model Submission {
+  id           String           @id @default(uuid())
+  assignmentId String
+  assignment   Assignment       @relation(fields: [assignmentId], references: [id])
+  studentId    String
+  student      User             @relation(fields: [studentId], references: [id])
+  content      String
+  status       SubmissionStatus @default(SUBMITTED)
+  submittedAt  DateTime         @default(now())
+
+  grade Grade?
+  peerReviews PeerReview[]
+
+  @@unique([assignmentId, studentId])
+  @@map("submissions")
+}
+
+model Grade {
+  id           String     @id @default(uuid())
+  submissionId String     @unique
+  submission   Submission @relation(fields: [submissionId], references: [id])
+  studentId    String
+  student      User       @relation("GradeStudent", fields: [studentId], references: [id])
+  givenById    String
+  givenBy      User       @relation("GradeGivenBy", fields: [givenById], references: [id])
+  score        Int
+  feedback     String?
+  gradedAt     DateTime   @default(now())
+
+  @@map("grades")
+}
+
+model AttendanceSession {
+  id          String   @id @default(uuid())
+  courseId    String
+  course      Course   @relation(fields: [courseId], references: [id])
+  professorId String
+  professor   User     @relation(fields: [professorId], references: [id])
+  qrToken     String   @unique
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  records AttendanceRecord[]
+
+  @@index([courseId])
+  @@map("attendance_sessions")
+}
+
+model AttendanceRecord {
+  id          String            @id @default(uuid())
+  sessionId   String
+  session     AttendanceSession @relation(fields: [sessionId], references: [id])
+  studentId   String
+  student     User              @relation(fields: [studentId], references: [id])
+  checkedInAt DateTime          @default(now())
+
+  @@unique([sessionId, studentId])
+  @@index([studentId])
+  @@map("attendance_records")
+}
+
+model Exam {
+  id              String     @id @default(uuid())
+  title           String
+  courseId        String
+  course          Course     @relation(fields: [courseId], references: [id])
+  createdById     String
+  createdBy       User       @relation("ExamCreatedBy", fields: [createdById], references: [id])
+  durationMinutes Int
+  startsAt        DateTime
+  endsAt          DateTime
+  status          ExamStatus @default(DRAFT)
+  // Soft delete — see Course.archivedAt above. A student's exam result must
+  // never be erased because someone clicked delete on the exam later.
+  archivedAt      DateTime?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  questions ExamQuestion[]
+  attempts  ExamAttempt[]
+
+  @@index([courseId])
+  @@map("exams")
+}
+
+model ExamQuestion {
+  id            String       @id @default(uuid())
+  examId        String
+  exam          Exam         @relation(fields: [examId], references: [id])
+  type          QuestionType
+  prompt        String
+  options       Json?
+  correctOption Int?
+  points        Int          @default(1)
+  order         Int          @default(0)
+
+  answers ExamAnswer[]
+
+  @@map("exam_questions")
+}
+
+model ExamAttempt {
+  id          String    @id @default(uuid())
+  examId      String
+  exam        Exam      @relation(fields: [examId], references: [id])
+  studentId   String
+  student     User      @relation(fields: [studentId], references: [id])
+  startedAt   DateTime  @default(now())
+  submittedAt DateTime?
+  score       Int?
+
+  flagged     Boolean   @default(false)
+  flagReason  String?
+  flaggedAt   DateTime?
+
+  answers ExamAnswer[]
+
+  @@unique([examId, studentId])
+  @@index([examId])
+  @@map("exam_attempts")
+}
+
+model ExamAnswer {
+  id             String       @id @default(uuid())
+  attemptId      String
+  attempt        ExamAttempt  @relation(fields: [attemptId], references: [id])
+  questionId     String
+  question       ExamQuestion @relation(fields: [questionId], references: [id])
+  selectedOption Int?
+  essayText      String?
+
+  @@unique([attemptId, questionId])
+  @@map("exam_answers")
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id])
+  type      NotificationType
+  title     String
+  body      String
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  // Hottest query in the whole app at scale: "give me this user's unread
+  // notifications" runs on basically every page load.
+  @@index([userId, read])
+  @@map("notifications")
+}
+
+model PortfolioItem {
+  id          String   @id @default(uuid())
+  studentId   String
+  student     User     @relation(fields: [studentId], references: [id])
+  title       String
+  description String?
+  link        String?
+  createdAt   DateTime @default(now())
+
+  @@map("portfolio_items")
+}
+
+model Certificate {
+  id         String   @id @default(uuid())
+  studentId  String
+  student    User     @relation("CertificateStudent", fields: [studentId], references: [id])
+  courseId   String
+  course     Course   @relation(fields: [courseId], references: [id])
+  issuedById String
+  issuedBy   User     @relation("CertificateIssuedBy", fields: [issuedById], references: [id])
+  issuedAt   DateTime @default(now())
+
+  @@unique([studentId, courseId])
+  @@map("certificates")
+}
+
+model JobListing {
+  id          String   @id @default(uuid())
+  companyId   String
+  company     User     @relation("JobPostedBy", fields: [companyId], references: [id])
+  title       String
+  description String
+  location    String?
+  createdAt   DateTime @default(now())
+
+  applications JobApplication[]
+
+  @@map("job_listings")
+}
+
+model JobApplication {
+  id        String     @id @default(uuid())
+  jobId     String
+  job       JobListing @relation(fields: [jobId], references: [id])
+  studentId String
+  student   User       @relation("JobApplicant", fields: [studentId], references: [id])
+  message   String?
+  appliedAt DateTime   @default(now())
+
+  @@unique([jobId, studentId])
+  @@map("job_applications")
+}
+
+model CvProfile {
+  id        String   @id @default(uuid())
+  studentId String   @unique
+  student   User     @relation(fields: [studentId], references: [id])
+  summary   String?
+  skills    String?
+  updatedAt DateTime @updatedAt
+
+  @@map("cv_profiles")
+}
+
+model Faculty {
+  id          String       @id @default(uuid())
+  name        String
+  departments Department[]
+
+  @@map("faculties")
+}
+
+model Department {
+  id        String   @id @default(uuid())
+  name      String
+  facultyId String
+  faculty   Faculty  @relation(fields: [facultyId], references: [id])
+  courses   Course[]
+
+  @@map("departments")
+}
+
+model LibraryResource {
+  id        String   @id @default(uuid())
+  title     String
+  author    String?
+  type      String
+  link      String?
+  addedById String
+  addedBy   User     @relation(fields: [addedById], references: [id])
+  createdAt DateTime @default(now())
+
+  @@map("library_resources")
+}
+
+model CourseMaterial {
+  id        String   @id @default(uuid())
+  courseId  String
+  course    Course   @relation(fields: [courseId], references: [id])
+  title     String
+  url       String
+  addedById String
+  addedBy   User     @relation(fields: [addedById], references: [id])
+  createdAt DateTime @default(now())
+
+  @@index([courseId])
+  @@map("course_materials")
+}
+
+model ParentLink {
+  id        String           @id @default(uuid())
+  parentId  String
+  parent    User             @relation("ParentOf", fields: [parentId], references: [id])
+  studentId String
+  student   User             @relation("ChildOf", fields: [studentId], references: [id])
+  status    ParentLinkStatus @default(PENDING)
+
+  approvedById    String?
+  approvedBy      User?     @relation("ParentLinkApprovedBy", fields: [approvedById], references: [id])
+  approvedAt      DateTime?
+  rejectionReason String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([parentId, studentId])
+  @@index([parentId])
+  @@index([studentId])
+  @@map("parent_links")
+}
+
+model Message {
+  id         String   @id @default(uuid())
+  senderId   String
+  sender     User     @relation("MessageSender", fields: [senderId], references: [id])
+  receiverId String
+  receiver   User     @relation("MessageReceiver", fields: [receiverId], references: [id])
+  content    String
+  read       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([senderId])
+  @@index([receiverId])
+  @@map("messages")
+}
+
+model ForumPost {
+  id        String     @id @default(uuid())
+  courseId  String
+  course    Course     @relation(fields: [courseId], references: [id])
+  authorId  String
+  author    User       @relation(fields: [authorId], references: [id])
+  title     String
+  content   String
+  status    PostStatus @default(PENDING)
+
+  reviewedById    String?
+  reviewedBy      User?     @relation("ForumPostReviewedBy", fields: [reviewedById], references: [id])
+  reviewedAt      DateTime?
+  rejectionReason String?
+
+  createdAt DateTime @default(now())
+
+  replies ForumReply[]
+
+  @@index([courseId, status])
+  @@map("forum_posts")
+}
+
+model ForumReply {
+  id        String    @id @default(uuid())
+  postId    String
+  post      ForumPost @relation(fields: [postId], references: [id])
+  authorId  String
+  author    User      @relation(fields: [authorId], references: [id])
+  content   String
+  createdAt DateTime  @default(now())
+
+  @@map("forum_replies")
+}
+
+model ProjectGroup {
+  id        String   @id @default(uuid())
+  courseId  String
+  course    Course   @relation(fields: [courseId], references: [id])
+  name      String
+  createdAt DateTime @default(now())
+
+  members GroupMember[]
+
+  @@map("project_groups")
+}
+
+model GroupMember {
+  id        String       @id @default(uuid())
+  groupId   String
+  group     ProjectGroup @relation(fields: [groupId], references: [id])
+  studentId String
+  student   User         @relation(fields: [studentId], references: [id])
+
+  @@unique([groupId, studentId])
+  @@map("group_members")
+}
+
+model PeerReview {
+  id           String     @id @default(uuid())
+  submissionId String
+  submission   Submission @relation(fields: [submissionId], references: [id])
+  reviewerId   String
+  reviewer     User       @relation(fields: [reviewerId], references: [id])
+  rating       Int
+  comment      String?
+  createdAt    DateTime   @default(now())
+
+  @@unique([submissionId, reviewerId])
+  @@map("peer_reviews")
+}
+
+model DemoRequest {
+  id          String   @id @default(uuid())
+  name        String
+  email       String
+  institution String?
+  phone       String?
+  message     String?
+  contacted   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@map("demo_requests")
+}
